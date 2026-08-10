@@ -1,0 +1,8 @@
+{
+  "name": "deepseek-messages",
+  "description": "Anthropic /v1/messages 协议适配器（构造 + 解析成对），目标 DeepSeek",
+  "version": "0.1.0",
+  "abi_version": 1,
+  "type": "protocol",
+  "deps": []
+}
