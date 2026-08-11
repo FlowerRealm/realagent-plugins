@@ -1,11 +1,16 @@
 /*
- * deepseek_messages.cpp — Anthropic /v1/messages 协议插件（type = protocol）
+ * v1_messages.cpp — /v1/messages 协议层插件（type = protocol）
+ *
+ * /v1/messages 是一种协议：Anthropic、DeepSeek、OpenRouter 等多家公司都实现同一端点。
+ * 本插件不认识任何供应商——请求构造与 SSE 解析（含 thinking 块）都是协议固有内容，
+ * 供应商差异（端点/模型/凭证默认值）由外层套壳插件（provider 壳）负责。
  *
  * 成对（ADR-0004）：
- *   build_request : 抽象对话（dialog_json）→ Anthropic /v1/messages 请求体
- *   parse_feed    : SSE 响应 → 事件（message_update / tool_use / stop）
+ *   build_request : 抽象对话（dialog_json）→ /v1/messages 请求体
+ *   parse_feed    : SSE 响应 → 事件（thinking_start / thinking_update / thinking_stop /
+ *                   message_update / tool_use / stop）
  *
- * 端点/模型可配（core 注入）：base_url / api_key / model
+ * 配置（core 注入）：base_url / api_key / model，均不设供应商默认值。
  */
 #include <plugin_api.h>
 
@@ -18,15 +23,16 @@
 namespace bj = boost::json;
 
 struct plugin_plugin {
-    std::string base_url;    // init 时从配置读入
+    std::string base_url;    // init 时从配置读入（可为空：供应商壳兜底）
     std::string api_key;
     std::string model;
 
     std::string buf;         // SSE 缓冲（未完整事件块）
-    std::string block_type;  // 当前 content block 类型（text / tool_use）
+    std::string block_type;  // 当前 content block 类型（text / thinking / tool_use）
     std::string tool_id;
     std::string tool_name;
     std::string tool_input;  // 累积 partial_json
+    std::string thinking_sig;  // 当前 thinking 块的 signature（回传历史用）
 };
 
 /* ==================== 工具函数 ==================== */
@@ -58,7 +64,7 @@ static plugin_status_t build_request(plugin_t* self, const char* dialog_json, pl
     // system（Anthropic 格式：字符串或 block 数组）
     if (!system.empty()) body["system"] = system;
 
-    // messages：抽象对话 → Anthropic 格式（合并相邻同 role）
+    // messages：抽象对话 → /v1/messages 格式（合并相邻同 role）
     bj::array msgs;
     if (d.contains("messages") && d.at("messages").is_array()) {
         for (const auto& m : d.at("messages").as_array()) {
@@ -84,6 +90,11 @@ static plugin_status_t build_request(plugin_t* self, const char* dialog_json, pl
                         out_block["content"] = b.at("content");
                         if (b.contains("is_error") && b.at("is_error").as_bool())
                             out_block["is_error"] = true;
+                    } else if (bt == "thinking") {
+                        // thinking 块（协议固有内容）原样回传，带 signature（缺失时省略）
+                        out_block["type"] = "thinking";
+                        out_block["thinking"] = b.at("thinking");
+                        if (b.contains("signature")) out_block["signature"] = b.at("signature");
                     }
                     blocks.push_back(out_block);
                 }
@@ -103,7 +114,7 @@ static plugin_status_t build_request(plugin_t* self, const char* dialog_json, pl
     }
     body["messages"] = msgs;
 
-    // tools（抽象 → Anthropic input_schema）
+    // tools（抽象 → input_schema）
     if (d.contains("tools") && d.at("tools").is_array()) {
         bj::array tools;
         for (const auto& t : d.at("tools").as_array()) {
@@ -123,7 +134,7 @@ static plugin_status_t build_request(plugin_t* self, const char* dialog_json, pl
     // —— 请求结果（插件 new char[] 分配；core 用完调 api->free 释放 = delete[]） ——
     const std::string u = p->base_url + "/v1/messages";
     bj::object hdrs_obj;
-    hdrs_obj["Authorization"] = "Bearer " + p->api_key;
+    if (!p->api_key.empty()) hdrs_obj["Authorization"] = "Bearer " + p->api_key;
     hdrs_obj["Content-Type"] = "application/json";
     hdrs_obj["anthropic-version"] = "2023-06-01";
     const std::string h = bj::serialize(hdrs_obj);
@@ -161,6 +172,23 @@ static void handle_sse_event(plugin_plugin* p, const std::string& event_type,
             p->tool_id = bj::value_to<std::string>(cb.at("id"));
             p->tool_name = bj::value_to<std::string>(cb.at("name"));
             p->tool_input.clear();
+        } else if (cbt == "thinking") {
+            // 思考块开始：先发 signature（Anthropic 格式），再发起始文本（部分端点起始块带文本）
+            if (cb.contains("signature"))
+                p->thinking_sig = bj::value_to<std::string>(cb.at("signature"));
+            if (sink) {
+                bj::object ev;
+                ev["signature"] = p->thinking_sig;
+                sink(sink_ctx, "thinking_start", json_str(ev).c_str());
+            }
+            if (cb.contains("thinking")) {
+                const std::string init = bj::value_to<std::string>(cb.at("thinking"));
+                if (!init.empty() && sink) {
+                    bj::object ev;
+                    ev["delta"] = init;
+                    sink(sink_ctx, "thinking_update", json_str(ev).c_str());
+                }
+            }
         }
     } else if (t == "content_block_delta") {
         const auto& delta = o.at("delta").as_object();
@@ -170,6 +198,11 @@ static void handle_sse_event(plugin_plugin* p, const std::string& event_type,
             bj::object ev;
             ev["delta"] = text;
             sink(sink_ctx, "message_update", json_str(ev).c_str());
+        } else if (dt == "thinking_delta" && p->block_type == "thinking" && sink) {
+            const std::string text = bj::value_to<std::string>(delta.at("thinking"));
+            bj::object ev;
+            ev["delta"] = text;
+            sink(sink_ctx, "thinking_update", json_str(ev).c_str());
         } else if (dt == "input_json_delta" && p->block_type == "tool_use") {
             p->tool_input += bj::value_to<std::string>(delta.at("partial_json"));
         }
@@ -183,6 +216,10 @@ static void handle_sse_event(plugin_plugin* p, const std::string& event_type,
             if (iec) ev["input"] = bj::object{};
             sink(sink_ctx, "tool_use", json_str(ev).c_str());
             p->block_type.clear();
+        } else if (p->block_type == "thinking") {
+            if (sink) sink(sink_ctx, "thinking_stop", "{}");
+            p->block_type.clear();
+            p->thinking_sig.clear();
         }
     } else if (t == "message_delta") {
         if (sink) {
@@ -250,13 +287,7 @@ static plugin_status_t init(plugin_t* self, plugin_core_t* core) {
     p->api_key = core->api->get_config(core, "api_key");
     p->base_url = core->api->get_config(core, "base_url");
     p->model = core->api->get_config(core, "model");
-    if (p->base_url.empty()) p->base_url = "https://api.deepseek.com/anthropic";
-    if (p->model.empty()) p->model = "deepseek-v4-flash";
-    if (p->api_key.empty()) {
-        core->api->log(core, PLUGIN_LOG_ERROR,
-                       "deepseek-messages: 缺少 api_key（env ANTHROPIC_API_KEY 或 settings.json）");
-        return PLUGIN_ERR;
-    }
+    // 不设供应商默认值：端点/模型由外层 provider 壳兜底
     return PLUGIN_OK;
 }
 
@@ -273,7 +304,7 @@ static void plugin_free(plugin_t* self, void* ptr) {
 static const plugin_api_t k_api = {
     .abi_version = PLUGIN_ABI_VERSION,
     .type = PLUGIN_TYPE_PROTOCOL,
-    .name = "deepseek-messages",
+    .name = "v1-messages",
     .init = init,
     .destroy = destroy,
     .on_event = nullptr,

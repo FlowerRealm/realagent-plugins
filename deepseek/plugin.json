@@ -1,0 +1,8 @@
+{
+  "name": "deepseek",
+  "description": "DeepSeek 供应商壳（type = protocol）：包住 v1-messages 协议层，兜底端点/模型/凭证默认值，无供应商特殊逻辑",
+  "version": "0.1.0",
+  "abi_version": 1,
+  "type": "protocol",
+  "deps": ["v1-messages"]
+}

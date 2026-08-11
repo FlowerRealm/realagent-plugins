@@ -25,17 +25,22 @@ function(add_plugin name src)
     CXX_VISIBILITY_PRESET hidden)
 endfunction()
 
+# —— 协议链（ADR-0004 嵌套：deepseek 壳包住 v1-messages 协议层） ——
+add_plugin(v1-messages v1-messages/v1_messages.cpp)
+add_plugin(deepseek deepseek/deepseek.cpp)
+
 add_plugin(perm-allow-all perm-allow-all/perm_allow_all.c)
+add_plugin(perm-ask perm-ask/perm_ask.c)
 add_plugin(core-tools core-tools/core_tools.c)
-add_plugin(deepseek-messages deepseek-messages/deepseek_messages.cpp)
 
-# deepseek-messages 用 C++ + boost::json（协议转换需要完整 JSON）
+# v1-messages / deepseek 用 C++ + boost::json（协议转换 / 壳兜底需要完整 JSON）
 find_package(Boost REQUIRED COMPONENTS json)
-target_link_libraries(deepseek-messages PRIVATE Boost::json)
+target_link_libraries(v1-messages PRIVATE Boost::json)
+target_link_libraries(deepseek PRIVATE Boost::json)
 
-# 安装：拷到项目级 .realagent/extensions/<name>/
+# 安装：每个插件一个目录（dylib + plugin.json 同目录，对齐 loader 发现约定）
 set(RA_EXT_DIR ${CMAKE_SOURCE_DIR}/../realagent/.realagent/extensions)
-install(TARGETS perm-allow-all core-tools deepseek-messages LIBRARY DESTINATION ${RA_EXT_DIR})
-install(FILES perm-allow-all/plugin.json DESTINATION ${RA_EXT_DIR}/perm-allow-all)
-install(FILES core-tools/plugin.json DESTINATION ${RA_EXT_DIR}/core-tools)
-install(FILES deepseek-messages/plugin.json DESTINATION ${RA_EXT_DIR}/deepseek-messages)
+foreach(p v1-messages deepseek perm-allow-all perm-ask core-tools)
+  install(TARGETS ${p} LIBRARY DESTINATION ${RA_EXT_DIR}/${p})
+  install(FILES ${p}/plugin.json DESTINATION ${RA_EXT_DIR}/${p})
+endforeach()

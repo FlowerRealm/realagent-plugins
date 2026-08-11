@@ -1,0 +1,8 @@
+{
+  "name": "perm-ask",
+  "description": "权限策略：危险工具一律询问用户（测试审批链路）",
+  "version": "0.1.0",
+  "abi_version": 1,
+  "type": "permission",
+  "deps": []
+}
