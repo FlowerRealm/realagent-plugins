@@ -8,7 +8,7 @@
  * 成对（ADR-0004）：
  *   build_request : 抽象对话（dialog_json）→ /v1/messages 请求体
  *   parse_feed    : SSE 响应 → 事件（thinking_start / thinking_update / thinking_stop /
- *                   message_update / tool_use / stop）
+ *                   message_update / tool_use / usage / stop）
  *
  * 配置（core 注入）：base_url / api_key / model，均不设供应商默认值。
  */
@@ -33,12 +33,49 @@ struct plugin_plugin {
     std::string tool_name;
     std::string tool_input;  // 累积 partial_json
     std::string thinking_sig;  // 当前 thinking 块的 signature（回传历史用）
+
+    // 本条 message 的 token 计数（绝对值，message_start 清零后逐帧合并）
+    int64_t u_input = 0;
+    int64_t u_output = 0;
+    int64_t u_cache_read = 0;
+    int64_t u_cache_write = 0;
 };
 
 /* ==================== 工具函数 ==================== */
 
 static std::string json_str(bj::value v) {
     return bj::serialize(v);
+}
+
+/* 取 usage 对象里的整数字段，缺失/类型不符按 0 —— 各家实现给的字段并不齐全 */
+static int64_t usage_num(const bj::object& u, const char* key) {
+    if (!u.contains(key)) return 0;
+    const bj::value& v = u.at(key);
+    return v.is_int64() ? v.as_int64() : (v.is_uint64() ? (int64_t)v.as_uint64() : 0);
+}
+
+/* 发一个 usage 事件：数值是"本条 message 到此为止的累计值"（绝对值，非增量）。
+ * 绝对值语义让 core 覆盖写即可，丢帧不会造成永久偏差；累加只在 core 跨 turn 做一次。
+ *
+ * 各家在不同帧里给不同字段（input 在 message_start，output 在 message_delta），
+ * 因此计数落在插件状态上合并后整体发出——下游永远收到完整一组，不必猜"0 是真的 0
+ * 还是这帧没给"。全零不发（无 usage 信息的端点保持静默）。 */
+static void merge_usage(plugin_plugin* p, const bj::object& u, plugin_event_sink_t sink,
+                        void* sink_ctx) {
+    if (usage_num(u, "input_tokens") > 0) p->u_input = usage_num(u, "input_tokens");
+    if (usage_num(u, "output_tokens") > 0) p->u_output = usage_num(u, "output_tokens");
+    if (usage_num(u, "cache_read_input_tokens") > 0)
+        p->u_cache_read = usage_num(u, "cache_read_input_tokens");
+    if (usage_num(u, "cache_creation_input_tokens") > 0)
+        p->u_cache_write = usage_num(u, "cache_creation_input_tokens");
+    if (!sink) return;
+    if (p->u_input == 0 && p->u_output == 0 && p->u_cache_read == 0 && p->u_cache_write == 0) return;
+    bj::object ev;
+    ev["input"] = p->u_input;
+    ev["output"] = p->u_output;
+    ev["cache_read"] = p->u_cache_read;
+    ev["cache_write"] = p->u_cache_write;
+    sink(sink_ctx, "usage", json_str(ev).c_str());
 }
 
 /* ==================== build_request ==================== */
@@ -164,7 +201,15 @@ static void handle_sse_event(plugin_plugin* p, const std::string& event_type,
     const bj::object& o = v.as_object();
     const std::string t = bj::value_to<std::string>(o.at("type"));
 
-    if (t == "content_block_start") {
+    if (t == "message_start") {
+        // 新 message：计数清零，再合并首帧 usage（input_tokens 在这里给）
+        p->u_input = p->u_output = p->u_cache_read = p->u_cache_write = 0;
+        if (o.contains("message") && o.at("message").is_object()) {
+            const auto& msg = o.at("message").as_object();
+            if (msg.contains("usage") && msg.at("usage").is_object())
+                merge_usage(p, msg.at("usage").as_object(), sink, sink_ctx);
+        }
+    } else if (t == "content_block_start") {
         const auto& cb = o.at("content_block").as_object();
         const std::string cbt = bj::value_to<std::string>(cb.at("type"));
         p->block_type = cbt;
@@ -222,6 +267,9 @@ static void handle_sse_event(plugin_plugin* p, const std::string& event_type,
             p->thinking_sig.clear();
         }
     } else if (t == "message_delta") {
+        // output_tokens 在这里给终值：先发 usage 再发 stop，保证下游收工时数字已定
+        if (o.contains("usage") && o.at("usage").is_object())
+            merge_usage(p, o.at("usage").as_object(), sink, sink_ctx);
         if (sink) {
             const auto& d = o.at("delta").as_object();
             bj::object ev;
