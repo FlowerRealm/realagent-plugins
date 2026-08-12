@@ -17,7 +17,9 @@
 #include <boost/json.hpp>
 #include <boost/system/error_code.hpp>
 
+#include <cstdio>
 #include <cstring>
+#include <exception>
 #include <string>
 
 namespace bj = boost::json;
@@ -192,9 +194,12 @@ static plugin_status_t build_request(plugin_t* self, const char* dialog_json, pl
 
 /* ==================== parse_feed（SSE 解析） ==================== */
 
-/* 解析一个 SSE 事件块（event/data 对），产出发给 sink */
-static void handle_sse_event(plugin_plugin* p, const std::string& event_type,
-                             const std::string& data, plugin_event_sink_t sink, void* sink_ctx) {
+/* 解析一个 SSE 事件块（event/data 对），产出发给 sink。
+ * 本函数按 /v1/messages 的帧结构直取字段（.at / as_object / value_to 均会抛），
+ * 帧一旦不合规就抛异常——包装层负责兜住，见 handle_sse_event。 */
+static void handle_sse_event_impl(plugin_plugin* p, const std::string& event_type,
+                                  const std::string& data, plugin_event_sink_t sink,
+                                  void* sink_ctx) {
     boost::system::error_code ec;
     bj::value v = bj::parse(data, ec);
     if (ec) return;
@@ -271,14 +276,38 @@ static void handle_sse_event(plugin_plugin* p, const std::string& event_type,
         if (o.contains("usage") && o.at("usage").is_object())
             merge_usage(p, o.at("usage").as_object(), sink, sink_ctx);
         if (sink) {
-            const auto& d = o.at("delta").as_object();
+            // delta 缺失/非对象不是丢帧的理由：stop 照发，reason 退回默认值。
+            // （守卫方式与上面的 usage 一致——同一个帧里两套写法迟早漏一个。）
             bj::object ev;
-            ev["reason"] = d.contains("stop_reason") ? d.at("stop_reason")
-                                                     : bj::string("stop");
+            ev["reason"] = bj::string("stop");
+            if (o.contains("delta") && o.at("delta").is_object()) {
+                const auto& d = o.at("delta").as_object();
+                if (d.contains("stop_reason")) ev["reason"] = d.at("stop_reason");
+            }
             sink(sink_ctx, "stop", json_str(ev).c_str());
         }
     }
     (void)event_type;
+}
+
+/* ABI 边界（ADR-0001）：异常绝不能穿出去。core 经 C 函数指针调 parse_feed，
+ * 中间还隔着 libcurl 的 C 栈帧——异常穿过去是未定义行为，实测直接 terminate
+ * 整个常驻服务。
+ *
+ * 但也绝不能吞掉：跳过畸形帧 = 正文/tool_use 悄悄消失，core 收到一个"成功但空"的
+ * 回答，用户看到什么都没发生且没有任何报错。那比崩溃更糟。
+ * 异常在此转成失败返回值，由 parse_feed 报 PLUGIN_ERR，core 中止本次调用。 */
+static bool handle_sse_event(plugin_plugin* p, const std::string& event_type,
+                             const std::string& data, plugin_event_sink_t sink, void* sink_ctx) {
+    try {
+        handle_sse_event_impl(p, event_type, data, sink, sink_ctx);
+        return true;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[v1-messages] SSE 帧不合规: %s | data=%.200s\n", e.what(), data.c_str());
+    } catch (...) {
+        fprintf(stderr, "[v1-messages] SSE 帧不合规（未知异常）| data=%.200s\n", data.c_str());
+    }
+    return false;
 }
 
 static plugin_status_t parse_feed(plugin_t* self, const char* chunk, plugin_event_sink_t sink,
@@ -308,7 +337,8 @@ static plugin_status_t parse_feed(plugin_t* self, const char* chunk, plugin_even
                 if (line.rfind("event:", 0) == 0) event_type = line.substr(6);
                 else if (line.rfind("data:", 0) == 0) data = line.substr(5);
             }
-            if (!data.empty()) handle_sse_event(p, event_type, data, sink, sink_ctx);
+            if (!data.empty() && !handle_sse_event(p, event_type, data, sink, sink_ctx))
+                return PLUGIN_ERR; // 帧不合规：报错给 core 中止本次调用，绝不静默跳过
             continue;
         }
         std::string block = p->buf.substr(0, pos);
@@ -323,7 +353,8 @@ static plugin_status_t parse_feed(plugin_t* self, const char* chunk, plugin_even
             if (line.rfind("event:", 0) == 0) event_type = line.substr(6);
             else if (line.rfind("data:", 0) == 0) data = line.substr(5);
         }
-        if (!data.empty()) handle_sse_event(p, event_type, data, sink, sink_ctx);
+        if (!data.empty() && !handle_sse_event(p, event_type, data, sink, sink_ctx))
+            return PLUGIN_ERR; // 同上
     }
     return PLUGIN_OK;
 }
