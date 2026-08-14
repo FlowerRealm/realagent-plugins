@@ -392,6 +392,8 @@ static const plugin_api_t k_api = {
     .decide = nullptr,
     .build_request = build_request,
     .parse_feed = parse_feed,
+    // 协议层供应商中立：不认识任何模型，也就没有清单可报（ADR-0009）
+    .list_models = nullptr,
 };
 
 extern "C" PLUGIN_EXPORT plugin_t* plugin_create(const plugin_api_t** out_api) {
