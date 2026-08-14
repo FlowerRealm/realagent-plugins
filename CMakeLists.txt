@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.25)
+cmake_minimum_required(VERSION 3.30)
 project(realagent-plugins C CXX)
 
 # 插件 SDK 头目录：默认指向兄弟仓库 realagent/core/sdk，可用 REALAGENT_SDK_DIR 覆盖
