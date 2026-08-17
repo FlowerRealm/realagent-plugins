@@ -2,7 +2,7 @@
   "name": "deepseek",
   "description": "DeepSeek 供应商壳：包住 v1-messages 协议层，兜底端点/模型/凭证默认值，无供应商特殊逻辑",
   "version": "0.1.0",
-  "abi_version": 4,
+  "abi_version": 5,
   "protocol": "v1-messages",
   "deps": []
 }

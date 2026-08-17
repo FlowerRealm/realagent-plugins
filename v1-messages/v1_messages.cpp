@@ -13,7 +13,7 @@
  *
  * 配置（core 注入）：base_url / api_key / model，均不设供应商默认值。
  */
-#include <realugin/plugin_api.h>
+#include <realagent/agent_caps.h>
 
 #include <boost/json.hpp>
 #include <boost/system/error_code.hpp>
@@ -25,8 +25,8 @@
 
 namespace bj = boost::json;
 
-struct plugin_plugin {
-    plugin_core_t* core = nullptr; // init 存下：跨边界内存要经 core->api->alloc 分配
+struct realugin_plugin {
+    realugin_host_t* core = nullptr; // init 存下：跨边界内存要经 core->api->alloc 分配
     std::string base_url;    // init 时从配置读入（可为空：供应商壳兜底）
     std::string api_key;
     std::string model;
@@ -48,7 +48,7 @@ struct plugin_plugin {
 /* ==================== 工具函数 ==================== */
 
 /* 交给 core 的字符串经 core->api->alloc 分配，由 core 释放（ADR-0011） */
-static char* core_dup(plugin_plugin* p, const std::string& s) {
+static char* core_dup(realugin_plugin* p, const std::string& s) {
     char* out = static_cast<char*>(p->core->api->alloc(p->core, s.size() + 1));
     if (out) memcpy(out, s.c_str(), s.size() + 1);
     return out;
@@ -71,7 +71,7 @@ static int64_t usage_num(const bj::object& u, const char* key) {
  * 各家在不同帧里给不同字段（input 在 message_start，output 在 message_delta），
  * 因此计数落在插件状态上合并后整体发出——下游永远收到完整一组，不必猜"0 是真的 0
  * 还是这帧没给"。全零不发（无 usage 信息的端点保持静默）。 */
-static void merge_usage(plugin_plugin* p, const bj::object& u, plugin_event_sink_t sink,
+static void merge_usage(realugin_plugin* p, const bj::object& u, realagent_event_sink_t sink,
                         void* sink_ctx) {
     if (usage_num(u, "input_tokens") > 0) p->u_input = usage_num(u, "input_tokens");
     if (usage_num(u, "output_tokens") > 0) p->u_output = usage_num(u, "output_tokens");
@@ -91,8 +91,8 @@ static void merge_usage(plugin_plugin* p, const bj::object& u, plugin_event_sink
 
 /* ==================== build_request ==================== */
 
-static const char* build_request(plugin_t* self, const char* dialog_json) {
-    auto* p = static_cast<plugin_plugin*>(self);
+static const char* build_request(realugin_plugin_t* self, const char* dialog_json) {
+    auto* p = static_cast<realugin_plugin*>(self);
     if (!dialog_json) return nullptr;
 
     boost::system::error_code ec;
@@ -198,8 +198,8 @@ static const char* build_request(plugin_t* self, const char* dialog_json) {
 /* 解析一个 SSE 事件块（event/data 对），产出发给 sink。
  * 本函数按 /v1/messages 的帧结构直取字段（.at / as_object / value_to 均会抛），
  * 帧一旦不合规就抛异常——包装层负责兜住，见 handle_sse_event。 */
-static void handle_sse_event_impl(plugin_plugin* p, const std::string& event_type,
-                                  const std::string& data, plugin_event_sink_t sink,
+static void handle_sse_event_impl(realugin_plugin* p, const std::string& event_type,
+                                  const std::string& data, realagent_event_sink_t sink,
                                   void* sink_ctx) {
     boost::system::error_code ec;
     bj::value v = bj::parse(data, ec);
@@ -297,9 +297,9 @@ static void handle_sse_event_impl(plugin_plugin* p, const std::string& event_typ
  *
  * 但也绝不能吞掉：跳过畸形帧 = 正文/tool_use 悄悄消失，core 收到一个"成功但空"的
  * 回答，用户看到什么都没发生且没有任何报错。那比崩溃更糟。
- * 异常在此转成失败返回值，由 parse_feed 报 PLUGIN_ERR，core 中止本次调用。 */
-static bool handle_sse_event(plugin_plugin* p, const std::string& event_type,
-                             const std::string& data, plugin_event_sink_t sink, void* sink_ctx) {
+ * 异常在此转成失败返回值，由 parse_feed 报 REALUGIN_ERR，core 中止本次调用。 */
+static bool handle_sse_event(realugin_plugin* p, const std::string& event_type,
+                             const std::string& data, realagent_event_sink_t sink, void* sink_ctx) {
     try {
         handle_sse_event_impl(p, event_type, data, sink, sink_ctx);
         return true;
@@ -311,12 +311,12 @@ static bool handle_sse_event(plugin_plugin* p, const std::string& event_type,
     return false;
 }
 
-static plugin_status_t parse_feed(plugin_t* self, const char* chunk, plugin_event_sink_t sink,
+static realugin_status_t parse_feed(realugin_plugin_t* self, const char* chunk, realagent_event_sink_t sink,
                                   void* sink_ctx) {
-    auto* p = static_cast<plugin_plugin*>(self);
+    auto* p = static_cast<realugin_plugin*>(self);
     if (!chunk) {
         // flush：剩余缓冲不再有完整事件，忽略
-        return PLUGIN_OK;
+        return REALUGIN_OK;
     }
     p->buf += chunk;
     // 按空行切 SSE 事件块
@@ -339,7 +339,7 @@ static plugin_status_t parse_feed(plugin_t* self, const char* chunk, plugin_even
                 else if (line.rfind("data:", 0) == 0) data = line.substr(5);
             }
             if (!data.empty() && !handle_sse_event(p, event_type, data, sink, sink_ctx))
-                return PLUGIN_ERR; // 帧不合规：报错给 core 中止本次调用，绝不静默跳过
+                return REALUGIN_ERR; // 帧不合规：报错给 core 中止本次调用，绝不静默跳过
             continue;
         }
         std::string block = p->buf.substr(0, pos);
@@ -355,50 +355,50 @@ static plugin_status_t parse_feed(plugin_t* self, const char* chunk, plugin_even
             else if (line.rfind("data:", 0) == 0) data = line.substr(5);
         }
         if (!data.empty() && !handle_sse_event(p, event_type, data, sink, sink_ctx))
-            return PLUGIN_ERR; // 同上
+            return REALUGIN_ERR; // 同上
     }
-    return PLUGIN_OK;
+    return REALUGIN_OK;
 }
 
 /* ==================== 生命周期 ==================== */
 
-static plugin_status_t init(plugin_t* self, plugin_core_t* core) {
-    auto* p = static_cast<plugin_plugin*>(self);
+static realugin_status_t init(realugin_plugin_t* self, realugin_host_t* core) {
+    auto* p = static_cast<realugin_plugin*>(self);
     p->core = core;
     p->api_key = core->api->get_config(core, "api_key");
     p->base_url = core->api->get_config(core, "base_url");
     p->model = core->api->get_config(core, "model");
     // 不设供应商默认值：端点/模型由外层 provider 壳兜底
-    return PLUGIN_OK;
+    return REALUGIN_OK;
 }
 
-static void destroy(plugin_t* self) {
-    auto* p = static_cast<plugin_plugin*>(self);
+static void destroy(realugin_plugin_t* self) {
+    auto* p = static_cast<realugin_plugin*>(self);
     delete p;
 }
 
 /* 能力表：两段，各一个函数。协议层供应商中立，不报模型清单（ADR-0009） */
-static const plugin_capability_t k_caps[] = {
-    {PLUGIN_CAP_REQUEST_BUILD,  (plugin_fn_t)build_request},
-    {PLUGIN_CAP_RESPONSE_PARSE, (plugin_fn_t)parse_feed},
+static const realugin_capability_t k_caps[] = {
+    {REALAGENT_CAP_REQUEST_BUILD,  (realugin_fn_t)build_request},
+    {REALAGENT_CAP_RESPONSE_PARSE, (realugin_fn_t)parse_feed},
 };
 
-static size_t capabilities(plugin_t* self, const plugin_capability_t** out) {
+static size_t capabilities(realugin_plugin_t* self, const realugin_capability_t** out) {
     (void)self;
     *out = k_caps; // 借阅：静态表，寿命 = 本容器在位时长
     return sizeof(k_caps) / sizeof(k_caps[0]);
 }
 
-static const plugin_api_t k_api = {
-    .abi_version = PLUGIN_ABI_VERSION,
+static const realugin_plugin_api_t k_api = {
+    .abi_version = REALUGIN_ABI_VERSION,
     .name = "v1-messages",
     .init = init,
     .destroy = destroy,
     .capabilities = capabilities,
 };
 
-extern "C" PLUGIN_EXPORT plugin_t* plugin_create(const plugin_api_t** out_api) {
-    auto* p = new plugin_plugin();
+extern "C" REALUGIN_EXPORT realugin_plugin_t* realugin_plugin_create(const realugin_plugin_api_t** out_api) {
+    auto* p = new realugin_plugin();
     if (!p) return nullptr;
     *out_api = &k_api;
     return p;

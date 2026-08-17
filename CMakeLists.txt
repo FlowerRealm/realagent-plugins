@@ -5,6 +5,8 @@ project(realagent-plugins C CXX)
 list(APPEND CMAKE_PREFIX_PATH "$ENV{HOME}/.local")
 # realugin_add_plugin / realugin_install_plugin 随 realugin 一起装，见 AddPlugin.cmake
 find_package(realugin REQUIRED)
+# realagent：能力键与签名（agent_caps.h）。realugin 只给机制，词汇在这边
+find_package(realagent REQUIRED)
 
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Debug)
@@ -14,13 +16,19 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# —— 协议链（ADR-0004 嵌套：deepseek 壳包住 v1-messages 协议层） ——
+# —— 协议链（ADR-0012 管线：deepseek 提供改请求/计价，v1-messages 提供生成/解析；
+#    两者互不调用，靠 plugin.json 的 protocol 连成一条 dep 边） ——
 realugin_add_plugin(v1-messages v1-messages/v1_messages.cpp)
+target_link_libraries(v1-messages PRIVATE realagent::sdk)
 realugin_add_plugin(deepseek deepseek/deepseek.cpp)
+target_link_libraries(deepseek PRIVATE realagent::sdk)
 
 realugin_add_plugin(perm-allow-all perm-allow-all/perm_allow_all.c)
+target_link_libraries(perm-allow-all PRIVATE realagent::sdk)
 realugin_add_plugin(perm-ask perm-ask/perm_ask.c)
+target_link_libraries(perm-ask PRIVATE realagent::sdk)
 realugin_add_plugin(core-tools core-tools/core_tools.c)
+target_link_libraries(core-tools PRIVATE realagent::sdk)
 
 # v1-messages / deepseek 用 C++ + boost::json（协议转换 / 壳兜底需要完整 JSON）
 find_package(Boost REQUIRED COMPONENTS json)

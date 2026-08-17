@@ -15,10 +15,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include <realugin/plugin_api.h>
+#include <realagent/agent_caps.h>
 
-struct plugin_plugin {
-    plugin_core_t* core; /* 交给 core 的结果内存要经 core->api->alloc（ADR-0012） */
+struct realugin_plugin {
+    realugin_host_t* core; /* 交给 core 的结果内存要经 core->api->alloc（ADR-0012） */
 };
 
 /* ==================== 最小 JSON 字符串字段提取 ==================== */
@@ -67,9 +67,9 @@ static int json_str_field(const char* json, const char* key, char* out, size_t o
 
 #define MAX_OUT 50000 /* 输出截断：50KB（对齐工具输出限制约定） */
 
-static plugin_result_t do_read(const char* params_json) {
+static realagent_result_t do_read(const char* params_json) {
     char path[4096];
-    plugin_result_t r = {.status = 1, .messages = "{\"error\":\"missing file_path\"}"};
+    realagent_result_t r = {.status = 1, .messages = "{\"error\":\"missing file_path\"}"};
     if (json_str_field(params_json, "file_path", path, sizeof(path)) != 0) return r;
 
     FILE* f = fopen(path, "r");
@@ -95,9 +95,9 @@ static plugin_result_t do_read(const char* params_json) {
 
 /* ==================== edit（+x-0 = 创建） ==================== */
 
-static plugin_result_t do_edit(const char* params_json) {
+static realagent_result_t do_edit(const char* params_json) {
     char path[4096], old_s[32768], new_s[32768];
-    plugin_result_t r = {.status = 1, .messages = "{\"error\":\"missing file_path\"}"};
+    realagent_result_t r = {.status = 1, .messages = "{\"error\":\"missing file_path\"}"};
     if (json_str_field(params_json, "file_path", path, sizeof(path)) != 0) return r;
     if (json_str_field(params_json, "new_string", new_s, sizeof(new_s)) != 0) {
         r.messages = "{\"error\":\"missing new_string\"}";
@@ -198,8 +198,8 @@ static size_t json_escape(const char* s, size_t n, char* out, size_t cap) {
 /* tool_output 帧（PROTOCOL.md）：命令还在跑的时候就把 stdout 推出去。
  * 与 tool_result 不是二选一——完整输出照旧在结果里回传，这里推的是"现在长什么样"。
  * call_id 是认领凭据：客户端靠它把这些碎片挂到对应那次工具调用下面。 */
-static void emit_output(plugin_t* p, const char* call_id, const char* text, size_t len) {
-    plugin_core_t* core = ((struct plugin_plugin*)p)->core;
+static void emit_output(realugin_plugin_t* p, const char* call_id, const char* text, size_t len) {
+    realugin_host_t* core = ((struct realugin_plugin*)p)->core;
     if (!core) return;
     char esc_text[LINE_MAX_LEN * 6 + 8], esc_id[512];
     char payload[sizeof(esc_text) + sizeof(esc_id) + 64];
@@ -217,9 +217,9 @@ static pthread_mutex_t g_bash_mtx = PTHREAD_MUTEX_INITIALIZER;
 static pid_t g_bash_pgid = 0;
 static volatile sig_atomic_t g_bash_killed = 0; /* 本次调用挨过刀：收尾时要盯着它死透 */
 
-static plugin_result_t do_bash(plugin_t* p, const char* call_id, const char* params_json) {
+static realagent_result_t do_bash(realugin_plugin_t* p, const char* call_id, const char* params_json) {
     char cmd[8192];
-    plugin_result_t r = {.status = 1, .messages = "{\"error\":\"missing command\"}"};
+    realagent_result_t r = {.status = 1, .messages = "{\"error\":\"missing command\"}"};
     if (json_str_field(params_json, "command", cmd, sizeof(cmd)) != 0) return r;
 
     int fds[2];
@@ -299,7 +299,7 @@ static plugin_result_t do_bash(plugin_t* p, const char* call_id, const char* par
  * 收尾（reap、拼结果）留在 do_bash 那条线上——在这儿等子进程死会把事件循环一起卡住。
  * 手上没有在跑的就什么都不做：「下一次调用该不该拒」是 core 的账，记在插件里
  * 只会变成一个迟早过期的标志位。 */
-static void interrupt_tool(plugin_t* p, const char* call_id) {
+static void interrupt_tool(realugin_plugin_t* p, const char* call_id) {
     (void)p;
     (void)call_id; /* 顺序执行（ADR-0002）：在跑的至多一个，不必按 id 找 */
     pthread_mutex_lock(&g_bash_mtx);
@@ -315,7 +315,7 @@ static void interrupt_tool(plugin_t* p, const char* call_id) {
 
 /* ==================== 插件接口 ==================== */
 
-static const plugin_tool_t k_tools[] = {
+static const realagent_tool_t k_tools[] = {
     {"read", "读文件", "读取指定文件的内容。路径不存在或不可读时返回错误。",
      "{\"type\":\"object\",\"properties\":{\"file_path\":{\"type\":\"string\",\"description\":\"文件路径\"}},\"required\":[\"file_path\"]}",
      0},
@@ -331,8 +331,8 @@ static const plugin_tool_t k_tools[] = {
 /* 结果是本次调用现造的 → 转移：经 core->api->alloc 分配，core 读完释放（ADR-0012）。
  * 各 do_* 内部用 malloc/字面量两种来源，此处统一拷成 core 的内存——
  * 于是"谁分配谁释放"这条老账在边界上只剩一种答案，bash 那块输出也不会再泄漏。 */
-static plugin_result_t own(plugin_t* p, plugin_result_t r) {
-    plugin_core_t* core = ((struct plugin_plugin*)p)->core;
+static realagent_result_t own(realugin_plugin_t* p, realagent_result_t r) {
+    realugin_host_t* core = ((struct realugin_plugin*)p)->core;
     const size_t n = r.messages ? strlen(r.messages) : 0;
     char* buf = (char*)core->api->alloc(core, n + 1);
     if (buf) {
@@ -343,54 +343,54 @@ static plugin_result_t own(plugin_t* p, plugin_result_t r) {
     return r;
 }
 
-static plugin_result_t execute_tool(plugin_t* p, const char* call_id,
+static realagent_result_t execute_tool(realugin_plugin_t* p, const char* call_id,
                                     const char* tool_name, const char* params_json) {
     if (strcmp(tool_name, "read") == 0) return own(p, do_read(params_json));
     if (strcmp(tool_name, "edit") == 0) return own(p, do_edit(params_json));
     if (strcmp(tool_name, "bash") == 0) return own(p, do_bash(p, call_id, params_json));
-    plugin_result_t r = {.status = 1, .messages = "{\"error\":\"unknown tool\"}"};
+    realagent_result_t r = {.status = 1, .messages = "{\"error\":\"unknown tool\"}"};
     return own(p, r);
 }
 
 /* 交出工具清单：借阅静态表，寿命 = 本容器在位时长（ADR-0012）。
  * core 不留副本，每次要用时来问一遍——零分配、零序列化。 */
-static size_t tool_list(plugin_t* p, const plugin_tool_t** out) {
+static size_t tool_list(realugin_plugin_t* p, const realagent_tool_t** out) {
     (void)p;
     *out = k_tools;
     return sizeof(k_tools) / sizeof(k_tools[0]);
 }
 
-static plugin_status_t init(plugin_t* p, plugin_core_t* core) {
-    ((struct plugin_plugin*)p)->core = core;
-    return PLUGIN_OK;
+static realugin_status_t init(realugin_plugin_t* p, realugin_host_t* core) {
+    ((struct realugin_plugin*)p)->core = core;
+    return REALUGIN_OK;
 }
 
-static void destroy(plugin_t* p) { free(p); }
+static void destroy(realugin_plugin_t* p) { free(p); }
 
 /* 能力表：交清单、按名执行、中止在跑的那次。各一个函数（ADR-0012）。
  * 中止是可选项——不报这个键的容器，core 只好等它自己跑完。 */
-static const plugin_capability_t k_caps[] = {
-    {PLUGIN_CAP_TOOL_LIST,      (plugin_fn_t)tool_list},
-    {PLUGIN_CAP_TOOL_EXECUTE,   (plugin_fn_t)execute_tool},
-    {PLUGIN_CAP_TOOL_INTERRUPT, (plugin_fn_t)interrupt_tool},
+static const realugin_capability_t k_caps[] = {
+    {REALAGENT_CAP_TOOL_LIST,      (realugin_fn_t)tool_list},
+    {REALAGENT_CAP_TOOL_EXECUTE,   (realugin_fn_t)execute_tool},
+    {REALAGENT_CAP_TOOL_INTERRUPT, (realugin_fn_t)interrupt_tool},
 };
 
-static size_t capabilities(plugin_t* p, const plugin_capability_t** out) {
+static size_t capabilities(realugin_plugin_t* p, const realugin_capability_t** out) {
     (void)p;
     *out = k_caps; /* 借阅：静态表，寿命 = 本容器在位时长 */
     return sizeof(k_caps) / sizeof(k_caps[0]);
 }
 
-static const plugin_api_t k_api = {
-    .abi_version = PLUGIN_ABI_VERSION,
+static const realugin_plugin_api_t k_api = {
+    .abi_version = REALUGIN_ABI_VERSION,
     .name = "core-tools",
     .init = init,
     .destroy = destroy,
     .capabilities = capabilities,
 };
 
-PLUGIN_EXPORT plugin_t* plugin_create(const plugin_api_t** out_api) {
-    plugin_t* p = (plugin_t*)malloc(sizeof(struct plugin_plugin));
+REALUGIN_EXPORT realugin_plugin_t* realugin_plugin_create(const realugin_plugin_api_t** out_api) {
+    realugin_plugin_t* p = (realugin_plugin_t*)malloc(sizeof(struct realugin_plugin));
     if (!p) return NULL;
     *out_api = &k_api;
     return p;
