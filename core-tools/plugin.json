@@ -2,7 +2,6 @@
   "name": "core-tools",
   "description": "内置工具：read / edit（+x-0=创建）/ bash",
   "version": "0.1.0",
-  "abi_version": 2,
-  "type": "tool",
+  "abi_version": 4,
   "deps": []
 }

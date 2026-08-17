@@ -2,7 +2,6 @@
   "name": "v1-messages",
   "description": "/v1/messages 协议层（构造 + SSE 解析成对，含 thinking 块）。协议是中立的，本插件不识别任何供应商",
   "version": "0.1.0",
-  "abi_version": 2,
-  "type": "protocol",
+  "abi_version": 4,
   "deps": []
 }

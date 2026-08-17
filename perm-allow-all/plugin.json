@@ -2,7 +2,6 @@
   "name": "perm-allow-all",
   "description": "永远允许的最小权限策略（打通链路用，非真实安全）",
   "version": "0.1.0",
-  "abi_version": 2,
-  "type": "permission",
+  "abi_version": 4,
   "deps": []
 }

@@ -1,21 +1,21 @@
 /*
- * deepseek.cpp — DeepSeek 供应商壳（type = protocol）
+ * deepseek.cpp — DeepSeek 供应商容器
  *
- * 套壳（ADR-0004 嵌套链的外层）：包住 v1-messages 协议层。壳做三件事——
- *   1. 声明供应商身份：deps 声明包住 v1-messages，core 据此解析协议链入口；
- *   2. 兜底供应商默认配置：端点 / 模型，凭证（api_key）；
- *   3. 计价（ADR-0009）：模型数据表是本壳自己的数据（自读自解析），拦下内层解析出的
- *      token 用量，按本次模型的单价算出钱，只向上报 status_update {"cost"}。
- *      **token 到此为止不再上传**——core 不认识 token，也不该认识。
+ * 在管线上提供两段（ADR-0012），外加一份模型清单：
+ *   request.refine : 收一个粗请求，还一个能真发出去的请求——补端点、默认模型名、凭证
+ *   usage.meter    : 收 token 用量，还一个钱数（USD）
+ *   model.list     : 报模型清单（name/owned_by/context，**单价不报**）
  *
- * 无任何供应商特殊逻辑：不做模型映射、不重写请求结构。协议层留空处填默认
- * （url 用供应商端点、model 用供应商默认、缺 Authorization 补凭证），其余原样透传。
+ * 它**不认识任何别的插件**：不知道粗请求是谁生成的，也不去调谁。装饰、接管、嵌套
+ * 在这个模型里都不存在——收一个请求、还一个请求，就这么回事。
+ *
+ * 无任何供应商特殊逻辑：不做模型映射、不重写请求结构。只填空处（url 补端点、
+ * body.model 空则填默认、headers 缺 Authorization 则补），其余原样透传。
  *
  * 模型数据表路径由 core 给（get_config("models_path")）：用户接管版存在就是它，
- * 否则是包内出厂版。表里有什么字段是本壳的事，core 只收 list_models 报上去的
- * name/owned_by/context——单价不报。
+ * 否则是包内出厂版。表里有什么字段是本容器的事，core 只收报上去的三个字段。
  */
-#include <plugin_api.h>
+#include <realugin/plugin_api.h>
 
 #include <boost/json.hpp>
 #include <boost/system/error_code.hpp>
@@ -28,88 +28,63 @@
 namespace bj = boost::json;
 
 struct plugin_plugin {
-    std::string base_url;      // init：config 或 DeepSeek 默认
+    plugin_core_t* core = nullptr; // init 存下：转移类内存要经 core->api->alloc
+    std::string base_url;
     std::string api_key;
     std::string model;
 
-    /* 模型数据表（本壳自有）：单价按模型名索引，键名随供应商，本壳不解释 */
+    /* 模型数据表（本容器自有）：单价按模型名索引，键名随供应商，core 不解释 */
     std::unordered_map<std::string, bj::object> pricing;
-    std::string models_json;   // 报给 core 的清单（去掉单价），list_models 返回它
-    std::string cur_model;     // 本次调用生效的模型名（build_request 记，算钱时查表用）
-
-    const plugin_api_t* inner_api = nullptr; // 内层 v1-messages（get_dependency 注入）
-    plugin_t* inner_inst = nullptr;
+    std::string models_json; // 报给 core 的清单（去掉单价），model.list 借阅它
+    std::string cur_model;   // 本次生效的模型名（refine 时记下，计价时查表用）
 };
 
-/* ==================== 工具函数 ==================== */
-
-/* 内层请求 → 最终请求：model 留空才填供应商默认（无映射），其余不动。
- * 顺手记下本次生效的模型名——算钱要按它查单价。 */
-static std::string refine_body(plugin_plugin* p, const char* inner_body) {
-    if (!inner_body) return "{}";
-    boost::system::error_code ec;
-    bj::value v = bj::parse(inner_body, ec);
-    if (ec || !v.is_object()) return inner_body; // 解析失败原样透传
-    auto& o = v.as_object();
-    if (!o.contains("model") || bj::value_to<std::string>(o.at("model")).empty())
-        o["model"] = p->model;
-    p->cur_model = bj::value_to<std::string>(o.at("model"));
-    return bj::serialize(v);
+/* 交给 core 的字符串经 core->api->alloc 分配、由 core 释放（转移，ADR-0012） */
+static char* core_dup(plugin_plugin* p, const std::string& s) {
+    char* out = static_cast<char*>(p->core->api->alloc(p->core, s.size() + 1));
+    if (out) memcpy(out, s.c_str(), s.size() + 1);
+    return out;
 }
 
-/* 内层 headers → 最终 headers：缺 Authorization 才补凭证（已配则原样） */
-static std::string refine_headers(const char* inner_headers, const std::string& api_key) {
-    if (!inner_headers) return "{}";
-    boost::system::error_code ec;
-    bj::value v = bj::parse(inner_headers, ec);
-    if (ec || !v.is_object()) return inner_headers;
-    auto& o = v.as_object();
-    if (api_key.empty()) return bj::serialize(v);
-    if (!o.contains("Authorization")) o["Authorization"] = "Bearer " + api_key;
-    return bj::serialize(v);
-}
+/* ==================== request.refine ==================== */
 
-/* ==================== 套壳：build_request / parse_feed ==================== */
-
-static plugin_status_t build_request(plugin_t* self, const char* dialog_json,
-                                     plugin_request_t* out) {
+/* 粗请求 → 精请求：只填空处。
+ *   url     : 粗请求给的是路径（协议层不知道端点），拼上本供应商的 base_url
+ *   body    : model 留空才填默认（不做映射：claude-* 原样透传）
+ *   headers : 缺 Authorization 才补凭证
+ * 顺手记下本次生效的模型名——计价要按它查单价。 */
+static const char* refine(plugin_t* self, const char* request_json) {
     auto* p = static_cast<plugin_plugin*>(self);
-    if (!dialog_json || !out || !p->inner_api || !p->inner_inst) return PLUGIN_ERR;
+    if (!request_json) return nullptr;
+    boost::system::error_code ec;
+    bj::value v = bj::parse(request_json, ec);
+    if (ec || !v.is_object()) return nullptr;
+    auto& req = v.as_object();
 
-    // 内层协议层构造初步请求
-    plugin_request_t inner{};
-    if (p->inner_api->build_request(p->inner_inst, dialog_json, &inner) != PLUGIN_OK)
-        return PLUGIN_ERR;
+    // url：粗请求里是相对路径，前面补上端点
+    const std::string path = req.contains("url") ? bj::value_to<std::string>(req.at("url")) : "";
+    req["url"] = path.rfind("http", 0) == 0 ? path : p->base_url + path;
 
-    // 壳的唯一动作：兜底供应商默认配置（端点 / 模型 / 凭证），其余透传
-    const std::string u = p->base_url + "/v1/messages";
-    const std::string h = refine_headers(inner.headers, p->api_key);
-    const std::string b = refine_body(p, inner.body);
-
-    // 释放内层分配（走内层自己的 free），最终请求整体为本壳自有分配
-    if (p->inner_api->free) {
-        p->inner_api->free(p->inner_inst, const_cast<char*>(inner.url));
-        p->inner_api->free(p->inner_inst, const_cast<char*>(inner.headers));
-        p->inner_api->free(p->inner_inst, const_cast<char*>(inner.body));
+    if (req.contains("body") && req.at("body").is_object()) {
+        auto& body = req.at("body").as_object();
+        if (!body.contains("model") || bj::value_to<std::string>(body.at("model")).empty())
+            body["model"] = p->model;
+        p->cur_model = bj::value_to<std::string>(body.at("model"));
     }
-
-    char* url = new char[u.size() + 1];
-    char* hdrs = new char[h.size() + 1];
-    char* bstr = new char[b.size() + 1];
-    memcpy(url, u.c_str(), u.size() + 1);
-    memcpy(hdrs, h.c_str(), h.size() + 1);
-    memcpy(bstr, b.c_str(), b.size() + 1);
-
-    out->url = url;
-    out->headers = hdrs;
-    out->body = bstr;
-    return PLUGIN_OK;
+    if (!p->api_key.empty() && req.contains("headers") && req.at("headers").is_object()) {
+        auto& h = req.at("headers").as_object();
+        if (!h.contains("Authorization")) h["Authorization"] = "Bearer " + p->api_key;
+    }
+    return core_dup(p, bj::serialize(v));
 }
+
+/* ==================== usage.meter ==================== */
 
 /* 算钱：token 用量 × 本次模型的单价，同名键点积 / 1M。
- * 键名两边同源（都是本供应商的口径），本壳不认识具体是哪些键，也不需要认识。
- * 表里没这个模型 / 没这个键 → 该维度不计，不猜、不兜底。 */
-static double price(plugin_plugin* p, const char* usage_json) {
+ * 键名两边同源（都是本供应商的口径），本容器不认识具体是哪些键，也不需要认识。
+ * 表里没这个模型 / 没这个键 → 该维度不计，不猜、不兜底。算不出返回 0（core 不发 cost）。 */
+static double meter(plugin_t* self, const char* usage_json) {
+    auto* p = static_cast<plugin_plugin*>(self);
     const auto it = p->pricing.find(p->cur_model);
     if (it == p->pricing.end() || !usage_json) return 0;
     boost::system::error_code ec;
@@ -124,39 +99,10 @@ static double price(plugin_plugin* p, const char* usage_json) {
     return total;
 }
 
-/* 事件透传夹层：usage 拦下换成钱，其余原样往上走 */
-struct SinkCtx {
-    plugin_plugin* p;
-    plugin_event_sink_t out;
-    void* out_ctx;
-};
+/* ==================== model.list ==================== */
 
-static void shell_sink(void* ctx, const char* type, const char* payload) {
-    auto* s = static_cast<SinkCtx*>(ctx);
-    if (type && std::strcmp(type, "usage") == 0) {
-        // token 到此为止：只把钱报上去（ADR-0009）。算不出钱就什么都不报——
-        // 没数据就是没数据，不发 0
-        const double cost = price(s->p, payload);
-        if (cost > 0) {
-            bj::object o;
-            o["cost"] = cost;
-            s->out(s->out_ctx, "status_update", bj::serialize(o).c_str());
-        }
-        return;
-    }
-    s->out(s->out_ctx, type, payload);
-}
-
-static plugin_status_t parse_feed(plugin_t* self, const char* chunk, plugin_event_sink_t sink,
-                                  void* sink_ctx) {
-    auto* p = static_cast<plugin_plugin*>(self);
-    if (!p->inner_api || !p->inner_inst) return PLUGIN_ERR;
-    SinkCtx ctx{p, sink, sink_ctx};
-    return p->inner_api->parse_feed(p->inner_inst, chunk, shell_sink, &ctx);
-}
-
-/* 模型清单：只报 core 用得着的三个字段，单价留在壳里 */
-static const char* list_models(plugin_t* self) {
+/* 借阅：指向本容器自有内存，寿命 = 容器在位时长，core 读完即用、不释放（ADR-0012） */
+static const char* model_list(plugin_t* self) {
     auto* p = static_cast<plugin_plugin*>(self);
     return p->models_json.empty() ? nullptr : p->models_json.c_str();
 }
@@ -205,6 +151,7 @@ static bool load_models(plugin_plugin* p, plugin_core_t* core, const char* path)
 
 static plugin_status_t init(plugin_t* self, plugin_core_t* core) {
     auto* p = static_cast<plugin_plugin*>(self);
+    p->core = core;
     p->base_url = core->api->get_config(core, "base_url");
     p->api_key = core->api->get_config(core, "api_key");
     p->model = core->api->get_config(core, "model");
@@ -213,42 +160,38 @@ static plugin_status_t init(plugin_t* self, plugin_core_t* core) {
 
     if (!load_models(p, core, core->api->get_config(core, "models_path"))) return PLUGIN_ERR;
 
-    if (!core->api->get_dependency) {
-        core->api->log(core, PLUGIN_LOG_ERROR, "deepseek: core 缺 get_dependency（ABI 过旧）");
+    // 看一眼现在有没有人能生成请求——没有的话本容器无从精修，早说比晚崩好。
+    // 问的是能力，不是某个具体插件：谁生成的本容器不关心（ADR-0012）
+    const char* const* names = nullptr;
+    if (core->api->providers(core, PLUGIN_CAP_REQUEST_BUILD, &names) == 0) {
+        core->api->log(core, PLUGIN_LOG_ERROR,
+                       "deepseek: 没有任何容器能生成请求，本容器无从精修");
         return PLUGIN_ERR;
     }
-    if (core->api->get_dependency(core, "v1-messages", &p->inner_api, &p->inner_inst) != PLUGIN_OK) {
-        core->api->log(core, PLUGIN_LOG_ERROR, "deepseek: 缺少前置依赖插件 v1-messages");
-        return PLUGIN_ERR;
-    }
-    if (!p->inner_api || !p->inner_api->build_request || !p->inner_api->parse_feed)
-        return PLUGIN_ERR;
     return PLUGIN_OK;
 }
 
-static void destroy(plugin_t* self) {
-    auto* p = static_cast<plugin_plugin*>(self);
-    delete p;
-}
+static void destroy(plugin_t* self) { delete static_cast<plugin_plugin*>(self); }
 
-static void plugin_free(plugin_t* self, void* ptr) {
+/* 能力表：三段，各一个函数。借阅静态表，寿命 = 容器在位时长 */
+static const plugin_capability_t k_caps[] = {
+    {PLUGIN_CAP_REQUEST_REFINE, (plugin_fn_t)refine},
+    {PLUGIN_CAP_USAGE_METER,    (plugin_fn_t)meter},
+    {PLUGIN_CAP_MODEL_LIST,     (plugin_fn_t)model_list},
+};
+
+static size_t capabilities(plugin_t* self, const plugin_capability_t** out) {
     (void)self;
-    delete[] static_cast<char*>(ptr);
+    *out = k_caps;
+    return sizeof(k_caps) / sizeof(k_caps[0]);
 }
 
 static const plugin_api_t k_api = {
     .abi_version = PLUGIN_ABI_VERSION,
-    .type = PLUGIN_TYPE_PROTOCOL,
     .name = "deepseek",
     .init = init,
     .destroy = destroy,
-    .on_event = nullptr,
-    .free = plugin_free,
-    .execute_tool = nullptr,
-    .decide = nullptr,
-    .build_request = build_request,
-    .parse_feed = parse_feed,
-    .list_models = list_models,
+    .capabilities = capabilities,
 };
 
 extern "C" PLUGIN_EXPORT plugin_t* plugin_create(const plugin_api_t** out_api) {

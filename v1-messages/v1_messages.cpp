@@ -1,18 +1,19 @@
 /*
- * v1_messages.cpp — /v1/messages 协议层插件（type = protocol）
+ * v1_messages.cpp — /v1/messages 协议层插件（协议能力：build_request + parse_feed）
  *
  * /v1/messages 是一种协议：Anthropic、DeepSeek、OpenRouter 等多家公司都实现同一端点。
  * 本插件不认识任何供应商——请求构造与 SSE 解析（含 thinking 块）都是协议固有内容，
  * 供应商差异（端点/模型/凭证默认值）由外层套壳插件（provider 壳）负责。
  *
- * 成对（ADR-0004）：
- *   build_request : 抽象对话（dialog_json）→ /v1/messages 请求体
- *   parse_feed    : SSE 响应 → 事件（thinking_start / thinking_update / thinking_stop /
- *                   message_update / tool_use / usage / stop）
+ * 提供管线上两段独立能力（ADR-0012）：
+ *   request.build  : 抽象对话（dialog_json）→ /v1/messages 粗请求 JSON
+ *   response.parse : SSE 响应 → 事件（thinking_start / thinking_update / thinking_stop /
+ *                    message_update / tool_use / usage / stop）
+ * 两段互不依赖，各自被 core 选中；粗请求里的端点/模型/凭证留空，由"改请求"那一段补。
  *
  * 配置（core 注入）：base_url / api_key / model，均不设供应商默认值。
  */
-#include <plugin_api.h>
+#include <realugin/plugin_api.h>
 
 #include <boost/json.hpp>
 #include <boost/system/error_code.hpp>
@@ -25,6 +26,7 @@
 namespace bj = boost::json;
 
 struct plugin_plugin {
+    plugin_core_t* core = nullptr; // init 存下：跨边界内存要经 core->api->alloc 分配
     std::string base_url;    // init 时从配置读入（可为空：供应商壳兜底）
     std::string api_key;
     std::string model;
@@ -44,6 +46,13 @@ struct plugin_plugin {
 };
 
 /* ==================== 工具函数 ==================== */
+
+/* 交给 core 的字符串经 core->api->alloc 分配，由 core 释放（ADR-0011） */
+static char* core_dup(plugin_plugin* p, const std::string& s) {
+    char* out = static_cast<char*>(p->core->api->alloc(p->core, s.size() + 1));
+    if (out) memcpy(out, s.c_str(), s.size() + 1);
+    return out;
+}
 
 static std::string json_str(bj::value v) {
     return bj::serialize(v);
@@ -82,13 +91,13 @@ static void merge_usage(plugin_plugin* p, const bj::object& u, plugin_event_sink
 
 /* ==================== build_request ==================== */
 
-static plugin_status_t build_request(plugin_t* self, const char* dialog_json, plugin_request_t* out) {
+static const char* build_request(plugin_t* self, const char* dialog_json) {
     auto* p = static_cast<plugin_plugin*>(self);
-    if (!dialog_json || !out) return PLUGIN_ERR;
+    if (!dialog_json) return nullptr;
 
     boost::system::error_code ec;
     bj::value dialog = bj::parse(dialog_json, ec);
-    if (ec) return PLUGIN_ERR;
+    if (ec) return nullptr;
 
     const bj::object& d = dialog.as_object();
     const std::string model = d.contains("model") ? bj::value_to<std::string>(d.at("model"))
@@ -170,26 +179,18 @@ static plugin_status_t build_request(plugin_t* self, const char* dialog_json, pl
         body["tool_choice"] = tc;
     }
 
-    // —— 请求结果（插件 new char[] 分配；core 用完调 api->free 释放 = delete[]） ——
-    const std::string u = p->base_url + "/v1/messages";
+    // —— 粗请求（一个 JSON，经 core->api->alloc 分配，由 core 释放；ADR-0012） ——
+    // 端点、模型名、凭证都可能是空的——那是"改请求"那一段的事，本插件不认识任何供应商
     bj::object hdrs_obj;
     if (!p->api_key.empty()) hdrs_obj["Authorization"] = "Bearer " + p->api_key;
     hdrs_obj["Content-Type"] = "application/json";
     hdrs_obj["anthropic-version"] = "2023-06-01";
-    const std::string h = bj::serialize(hdrs_obj);
-    const std::string b = bj::serialize(body);
 
-    char* url = new char[u.size() + 1];
-    char* hdrs = new char[h.size() + 1];
-    char* bstr = new char[b.size() + 1];
-    memcpy(url, u.c_str(), u.size() + 1);
-    memcpy(hdrs, h.c_str(), h.size() + 1);
-    memcpy(bstr, b.c_str(), b.size() + 1);
-
-    out->url = url;
-    out->headers = hdrs;
-    out->body = bstr;
-    return PLUGIN_OK;
+    bj::object req;
+    req["url"] = p->base_url + "/v1/messages";
+    req["headers"] = hdrs_obj;
+    req["body"] = body;
+    return core_dup(p, bj::serialize(req));
 }
 
 /* ==================== parse_feed（SSE 解析） ==================== */
@@ -363,6 +364,7 @@ static plugin_status_t parse_feed(plugin_t* self, const char* chunk, plugin_even
 
 static plugin_status_t init(plugin_t* self, plugin_core_t* core) {
     auto* p = static_cast<plugin_plugin*>(self);
+    p->core = core;
     p->api_key = core->api->get_config(core, "api_key");
     p->base_url = core->api->get_config(core, "base_url");
     p->model = core->api->get_config(core, "model");
@@ -375,25 +377,24 @@ static void destroy(plugin_t* self) {
     delete p;
 }
 
-static void plugin_free(plugin_t* self, void* ptr) {
+/* 能力表：两段，各一个函数。协议层供应商中立，不报模型清单（ADR-0009） */
+static const plugin_capability_t k_caps[] = {
+    {PLUGIN_CAP_REQUEST_BUILD,  (plugin_fn_t)build_request},
+    {PLUGIN_CAP_RESPONSE_PARSE, (plugin_fn_t)parse_feed},
+};
+
+static size_t capabilities(plugin_t* self, const plugin_capability_t** out) {
     (void)self;
-    delete[] static_cast<char*>(ptr);
+    *out = k_caps; // 借阅：静态表，寿命 = 本容器在位时长
+    return sizeof(k_caps) / sizeof(k_caps[0]);
 }
 
 static const plugin_api_t k_api = {
     .abi_version = PLUGIN_ABI_VERSION,
-    .type = PLUGIN_TYPE_PROTOCOL,
     .name = "v1-messages",
     .init = init,
     .destroy = destroy,
-    .on_event = nullptr,
-    .free = plugin_free,
-    .execute_tool = nullptr,
-    .decide = nullptr,
-    .build_request = build_request,
-    .parse_feed = parse_feed,
-    // 协议层供应商中立：不认识任何模型，也就没有清单可报（ADR-0009）
-    .list_models = nullptr,
+    .capabilities = capabilities,
 };
 
 extern "C" PLUGIN_EXPORT plugin_t* plugin_create(const plugin_api_t** out_api) {
